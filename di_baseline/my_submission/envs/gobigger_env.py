@@ -2,6 +2,7 @@ from typing import Any, List, Union, Optional, Tuple
 import time
 import copy
 import math
+from collections import OrderedDict
 import cv2
 import numpy as np
 from ding.envs import BaseEnv, BaseEnvTimestep, BaseEnvInfo
@@ -28,7 +29,9 @@ class GoBiggerEnv(BaseEnv):
         map_width=1000,
         resize_height=160,
         resize_width=160,
-        spatial=True,
+        spatial=False,
+        speed = False,
+        all_vision = False,
         train=True,
     )
 
@@ -43,6 +46,12 @@ class GoBiggerEnv(BaseEnv):
         self._resize_height = cfg.resize_height
         self._resize_width = cfg.resize_width
         self._spatial = cfg.spatial
+        self._speed = cfg.speed
+        self._all_vision = cfg.all_vision
+        self._cfg['obs_settings'] = dict(
+                with_spatial=self._spatial,
+                with_speed=self._speed,
+                with_all_vision=self._all_vision)
         self._train = cfg.train
         self._last_team_size = None
         self._init_flag = False
@@ -50,7 +59,7 @@ class GoBiggerEnv(BaseEnv):
     def _launch_game(self) -> Server:
         server = Server(self._cfg)
         server.start()
-        render = EnvRender(server.map_width, server.map_height, use_spatial=self._spatial)
+        render = EnvRender(server.map_width, server.map_height)
         server.set_render(render)
         self._player_names = sum(server.get_player_names_with_team(), [])
         return server
@@ -69,6 +78,7 @@ class GoBiggerEnv(BaseEnv):
         self._env.reset()
         raw_obs = self._env.obs()
         obs = self._obs_transform(raw_obs)
+        rew = self._get_reward(raw_obs)
         return obs
 
     def close(self) -> None:
@@ -88,6 +98,7 @@ class GoBiggerEnv(BaseEnv):
 
     def _obs_transform(self, obs: tuple) -> list:
         global_state, player_state = obs
+        player_state = OrderedDict(player_state)
         # global
         # 'border': [map_width, map_height] fixed map size
         total_time_feat = one_hot_np(round(min(1200, global_state['total_time']) / 100), 13)
@@ -270,3 +281,242 @@ class GoBiggerEnv(BaseEnv):
             replay_path = './video'
         self._replay_path = replay_path
         raise NotImplementedError
+
+def action_space(angle_num):
+    angle = 2 * np.pi * np.arange(angle_num) / angle_num
+
+    angle_direction = np.stack([np.cos(angle), np.sin(angle)], axis=1) # [n, 2]
+    zero_direction = np.zeros((angle_num, 2)) # [n, 2]
+    direction_action = np.stack([zero_direction, angle_direction, angle_direction, angle_direction, zero_direction], axis=0) # [5, n, 2]
+
+    discrete_action = np.zeros((5, angle_num, 4))
+    discrete_action[np.array([0, 1, 2, 3, 4]), :, np.array([0, 0, 1, 2, 3])] = 1
+
+    action = np.concatenate([direction_action, discrete_action], axis=2).reshape(5 * angle_num, 6)
+    return action
+
+def obs_pad(obs, pad_num, shape):
+    obs_num = len(obs)
+    if obs_num < pad_num:
+        obs_ = np.zeros((pad_num - obs_num, *shape))
+        if obs_num > 0:
+            obs = np.concatenate([obs, obs_])
+        else:
+            obs = obs_
+    obs = obs[:pad_num]
+    mask = np.zeros(pad_num)
+    mask[:obs_num] = 1.0
+    return obs, mask
+
+def unit_id(unit_player, unit_team, ego_player, ego_team, team_size):
+    unit_player, unit_team, ego_player, ego_team = int(unit_player) % team_size, int(unit_team), int(ego_player) % team_size, int(ego_team)
+    # The ego team's id is always 0, enemey teams' ids are 1,2,...,team_num-1
+    # The ego player's id is always 0, allies' ids are 1,2,...,player_num_per_team-1
+    if unit_team != ego_team:
+        player_id = unit_player
+        team_id = unit_team if unit_team > ego_team else unit_team + 1
+    else:
+        if unit_player != ego_player:
+            player_id = unit_player if unit_player > ego_player else unit_player + 1
+        else:
+            player_id = 0
+        team_id = 0
+
+    return [team_id, player_id]
+
+def food_encode(clone, food, left_top_x, left_top_y, right_bottom_x, right_bottom_y):
+    w = (right_bottom_x - left_top_x) // 16 + 1
+    h = (right_bottom_y - left_top_y) // 16 + 1
+    food_map = np.zeros((2, h, w))
+
+    w_ = (right_bottom_x - left_top_x) // 8 + 1
+    h_ = (right_bottom_y - left_top_y) // 8 + 1
+    food_grid = [ [ [] for j in range(w_) ] for i in range(h_) ]
+    food_relation = np.zeros((len(clone), 7 * 7 + 1, 3))
+
+    for p in food:
+        x = min(max(p[0], left_top_x), right_bottom_x) - left_top_x
+        y = min(max(p[1], left_top_y), right_bottom_y) - left_top_y
+        r = p[2]
+        # encode food density map
+        i, j = int(y // 16), int(x // 16)
+        food_map[0, i, j] += r * r
+        # encode food fine grid
+        i, j = int(y // 8), int(x // 8)
+        food_grid[i][j].append([(x - 8 * j) / 8, (y - 8 * i) / 8, r])
+
+    for c_id, p in enumerate(clone):
+        x = min(max(p[0], left_top_x), right_bottom_x) - left_top_x
+        y = min(max(p[1], left_top_y), right_bottom_y) - left_top_y
+        r = p[2]
+        # encode food density map
+        i, j = int(y // 16), int(x // 16)
+        if int(p[3]) == 0 and int(p[4]) == 0:
+            food_map[1, i, j] += r * r
+        # encode food fine grid
+        i, j = int(y // 8), int(x // 8)
+        t, b, l, r = max(i - 3, 0), min(i + 4, h_), max(j - 3, 0), min(j + 4, w_)
+        for ii in range(t, b):
+            for jj in range(l, r):
+                for f in food_grid[ii][jj]:
+                    food_relation[c_id][(ii - t) * 7 + jj - l][0] = f[0]
+                    food_relation[c_id][(ii - t) * 7 + jj - l][1] = f[1]
+                    food_relation[c_id][(ii - t) * 7 + jj - l][2] += f[2] * f[2]
+
+        food_relation[c_id][-1][0] = (x - j * 8) / 8
+        food_relation[c_id][-1][1] = (y - i * 8) / 8
+        food_relation[c_id][-1][2] = r / 10
+
+    food_map[0, :, :] = np.sqrt(food_map[0, :, :]) / 2
+    food_map[1, :, :] = np.sqrt(food_map[1, :, :]) / 10
+    food_relation[:, :-1, 2] = np.sqrt(food_relation[:, :-1, 2]) / 2
+    food_relation = food_relation.reshape(len(clone), -1)
+    return food_map, food_relation
+
+def clone_encode(clone):
+    pos = clone[:, :2] / 100
+    rds = clone[:, 2:3] / 10
+    ids = np.zeros((len(clone), 12))
+    ids[np.arange(len(clone)), (clone[:, 3] * 3 + clone[:, 4]).astype(np.int64)] = 1.0
+    slpit = (clone[:, 2:3] - 10) / 10
+    eject = (clone[:, 2:3] - 10) / 10
+    clone = np.concatenate([pos, rds, ids, slpit, eject], axis=1)
+    return clone
+
+def relation_encode(point_1, point_2):
+    pos_rlt_1 = point_2[None,:,:2] - point_1[:,None,:2] # relative position
+    pos_rlt_2 = np.linalg.norm(pos_rlt_1, ord=2, axis=2, keepdims=True) # distance
+    pos_rlt_3 = point_1[:,None,2:3] - pos_rlt_2 # whether source collides with target
+    pos_rlt_4 = point_2[None,:,2:3] - pos_rlt_2 # whether target collides with source
+    pos_rlt_5 = (2 + np.sqrt(0.5)) * point_1[:,None,2:3] - pos_rlt_2 # whether source's split collides with target
+    pos_rlt_6 = (2 + np.sqrt(0.5)) * point_2[None,:,2:3] - pos_rlt_2 # whether target's split collides with source
+    rds_rlt_1 = point_1[:,None,2:3] - point_2[None,:,2:3] # whether source can eat target
+    rds_rlt_2 = np.sqrt(0.5) * point_1[:,None,2:3] - point_2[None,:,2:3] # whether source's split can eat target
+    rds_rlt_3 = np.sqrt(0.5) * point_2[None,:,2:3] - point_1[:,None,2:3] # whether target's split can eat source
+    rds_rlt_4 = point_1[:,None,2:3].repeat(len(point_2), axis=1) # target radius
+    rds_rlt_5 = point_2[None,:,2:3].repeat(len(point_1), axis=0) # target radius
+    relation = np.concatenate([pos_rlt_1 / 100, pos_rlt_2 / 100, pos_rlt_3 / 100, pos_rlt_4 / 100, pos_rlt_5 / 100, pos_rlt_6 / 100, rds_rlt_1 / 10, rds_rlt_2 / 10, rds_rlt_3 / 10, rds_rlt_4 / 10, rds_rlt_5 / 10], axis=2)
+    return relation
+
+def team_obs_stack(team_obs):
+    result = {}
+    for k in team_obs[0].keys():
+        result[k] = [o[k] for o in team_obs]
+    return result
+
+@ENV_REGISTRY.register('gobigger_hybrid')
+class GoBiggerHybridEnv(GoBiggerEnv):
+    config = dict(
+        player_num_per_team=2,
+        team_num=3,
+        match_time=1200,
+        map_height=1000,
+        map_width=1000,
+        spatial=False,
+        speed = False,
+        all_vision = False,
+        train=True,
+        food_pad_num=24,
+        thorn_pad_num=16,
+        angle_num=32,
+    )
+
+    def __init__(self, cfg: dict) -> None:
+        self._cfg = cfg
+        self._player_num_per_team = cfg.player_num_per_team
+        self._team_num = cfg.team_num
+        self._player_num = self._player_num_per_team * self._team_num
+        self._match_time = cfg.match_time
+        self._map_height = cfg.map_height
+        self._map_width = cfg.map_width
+
+        self._last_team_size = None
+        self._init_flag = False
+        self._spatial = cfg.spatial
+        self._speed = cfg.speed
+        self._all_vision = cfg.all_vision
+        self._cfg['obs_settings'] = dict(
+                with_spatial=self._spatial,
+                with_speed=self._speed,
+                with_all_vision=self._all_vision)
+        self._train = cfg.train
+
+        self._action_space = action_space(cfg.angle_num)
+
+    def _obs_transform(self, obs: tuple) -> list:
+        global_state, player_state = obs
+        player_state = OrderedDict(player_state)
+        # global
+        # 'border': [map_width, map_height] fixed map size
+        total_time = global_state['total_time']
+        last_time = global_state['last_time']
+        rest_time = total_time - last_time
+        # only use leaderboard rank
+        # leaderboard_feat = np.zeros((self._team_num, self._team_num))
+        # for idx, (team_name, team_size) in enumerate(global_state['leaderboard'].items()):
+        #     team_name_number = int(team_name[-1])
+        #     leaderboard_feat[idx, team_name_number] = 1
+        # leaderboard_feat = leaderboard_feat.reshape(-1)
+        # global_feat = np.concatenate([total_time_feat, last_time_feat, leaderboard_feat])
+
+        # player
+        obs = []
+        collate_ignore_raw_obs = []
+        for n, value in player_state.items():
+            # scalar feat
+            # get margin
+            left_top_x, left_top_y, right_bottom_x, right_bottom_y = value['rectangle']
+            center_x, center_y = (left_top_x + right_bottom_x) / 2, (left_top_y + right_bottom_y) / 2
+            left_margin, right_margin = left_top_x, self._map_width - right_bottom_x
+            top_margin, bottom_margin = left_top_y, self._map_height - right_bottom_y
+            # get scalar feat
+            scalar_obs = np.array([rest_time / 1000, left_margin / 1000, right_margin / 1000, top_margin / 1000, bottom_margin / 1000])
+
+            # unit feat
+            overlap = value['overlap']
+            # load units
+            food = np.array(overlap['food'] + overlap['spore']) if len(overlap['food'] + overlap['spore']) > 0 else np.array([[center_x, center_y, 0]])
+            thorn = np.array(overlap['thorns']) if len(overlap['thorns']) > 0 else np.array([[center_x, center_y, 0]])
+            clone = np.array([[x[0], x[1], x[2], *unit_id(x[3], x[4], n, value['team_name'], self._player_num_per_team)] for x in overlap['clone']]) if len(overlap['clone']) > 0 else np.array([[center_x, center_y, 0, 0, 0]])
+            overlap['clone'] = [[x[0], x[1], x[2], int(x[3]), int(x[4])] for x in overlap['clone']]
+            # encode units
+            food, food_relation = food_encode(clone, food, left_top_x, left_top_y, right_bottom_x, right_bottom_y)
+            thorn_relation = relation_encode(clone, thorn)
+            clone_relation = relation_encode(clone, clone)
+            clone = clone_encode(clone)
+
+            player_obs = {
+                'scalar': scalar_obs.astype(np.float32),
+                'food': food.astype(np.float32),
+                'food_relation': food_relation.astype(np.float32),
+                'thorn_relation': thorn_relation.astype(np.float32),
+                'clone': clone.astype(np.float32),
+                'clone_relation': clone_relation.astype(np.float32),
+                'action_space': self._action_space.astype(np.float32),
+                'collate_ignore_raw_obs': {'overlap': overlap},
+            }
+            obs.append(player_obs)
+
+        team_obs = []
+        for i in range(self._team_num):
+            team_obs.append(team_obs_stack(obs[i * self._player_num_per_team: (i + 1) * self._player_num_per_team]))
+        return team_obs
+
+    def _act_transform(self, act: list) -> dict:
+        act = np.concatenate([item for item in act], axis=0)
+        return {n: self._to_raw_action(a) for n, a in zip(self._player_names, act)}
+
+    @staticmethod
+    def _to_raw_action(act) -> Tuple[float, float, int]:
+        # -1, 0, 1, 2(noop, eject, split, gather)
+        action_type, direction = act[2:], act[:2]
+        action_type = round(np.sum(action_type * np.array([-1, 0, 1, 2])))
+        x, y = direction if np.sum(direction * direction) > 1e-5 else [None, None]
+        return [x, y, action_type]
+
+# from easydict import EasyDict
+# env = GoBiggerHybridEnv(EasyDict(GoBiggerHybridEnv.config))
+# obs = env.reset()
+# print(obs[0]['food_relation'][0][0])
+# action = np.array([[1,0,1,0,0,0],[0,1,1,0,0,0]])
+# print(env.step([action,action,action]).reward)

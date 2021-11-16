@@ -1,1 +1,1 @@
-from .gobigger_env import GoBiggerEnv
+from .gobigger_env import GoBiggerEnv, GoBiggerHybridEnv
